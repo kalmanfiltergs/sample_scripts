@@ -1,4 +1,155 @@
 import os
+import pyarrow.parquet as pq
+import torch
+from torch.utils.data import Dataset, DataLoader
+from multiprocessing import Pool, cpu_count
+import pandas as pd
+import bisect
+
+def get_num_rows(file_path):
+    try:
+        parquet_file = pq.ParquetFile(file_path)
+        return parquet_file.metadata.num_rows
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+        return 0
+
+class ParquetDataset(Dataset):
+    def __init__(self, file_paths):
+        """
+        Args:
+            file_paths (list): List of paths to Parquet files.
+        """
+        self.file_paths = file_paths
+        self.num_workers = min(100, cpu_count())  # Utilize up to 100 CPUs
+
+        # Parallelize the row counting
+        with Pool(self.num_workers) as pool:
+            self.rows_per_file = pool.map(get_num_rows, self.file_paths)
+
+        # Create a cumulative sum for quick index mapping
+        self.cumulative_rows = pd.Series(self.rows_per_file).cumsum().tolist()
+        self.total_rows = self.cumulative_rows[-1] if self.cumulative_rows else 0
+
+    def __len__(self):
+        return self.total_rows
+
+    def __getitem__(self, idx):
+        # Binary search to find the file that contains the idx
+        file_idx = bisect.bisect_right(self.cumulative_rows, idx)
+        if file_idx == 0:
+            row_idx = idx
+        else:
+            row_idx = idx - self.cumulative_rows[file_idx - 1]
+
+        file_path = self.file_paths[file_idx]
+        
+        # Read only the required row
+        try:
+            table = pq.read_table(
+                file_path,
+                columns=None,  # Specify columns if needed
+                use_threads=True,
+                skip_rows=row_idx,
+                num_rows=1
+            )
+            df = table.to_pandas()
+            data = df.iloc[0].to_dict()
+            
+            # Convert to tensors or desired format
+            # Example: Assuming all values are numerical and needed as float tensors
+            tensor = torch.tensor(list(data.values()), dtype=torch.float)
+            return tensor
+        except Exception as e:
+            print(f"Error reading row {row_idx} from {file_path}: {e}")
+            # Return a default tensor or handle the error as needed
+            return torch.zeros(1)  # Example default
+
+
+def create_dataloader(file_paths, batch_size=64, shuffle=True, num_workers=100):
+    dataset = ParquetDataset(file_paths)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=False,  # Disabled since no GPU is used
+        prefetch_factor=2,  # Adjust based on memory and performance
+        persistent_workers=True  # Keep workers alive between epochs for efficiency
+    )
+    return dataloader
+
+
+if __name__ == "__main__":
+    # Example list of Parquet files
+    file_list = [
+        '/path/to/data/file1.parquet',
+        '/path/to/data/file2.parquet',
+        # Add all your Parquet file paths here
+    ]
+
+    # Parameters
+    batch_size = 128
+    num_epochs = 10
+    learning_rate = 1e-3
+
+    # Create DataLoader
+    dataloader = create_dataloader(
+        file_paths=file_list,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=100  # Utilize all available CPUs
+    )
+
+    # Define your PyTorch model
+    class YourPyTorchModel(torch.nn.Module):
+        def __init__(self, input_size, num_classes):
+            super(YourPyTorchModel, self).__init__()
+            self.fc = torch.nn.Linear(input_size, num_classes)
+        
+        def forward(self, x):
+            return self.fc(x)
+
+    # Initialize model, optimizer, and loss function
+    input_size = 100  # Replace with actual input size
+    num_classes = 10  # Replace with actual number of classes
+    model = YourPyTorchModel(input_size, num_classes)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    # Move model to CPU
+    device = torch.device('cpu')
+    model.to(device)
+
+    # Training Loop
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0.0
+        for batch_idx, batch in enumerate(dataloader):
+            batch = batch.to(device)
+
+            # Assume the last column is the target; adjust as needed
+            inputs = batch[:, :-1]
+            targets = batch[:, -1].long()
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+            if (batch_idx + 1) % 100 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{batch_idx+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
+
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{num_epochs}] completed. Average Loss: {avg_loss:.4f}")
+
+
+
+
+import os
 import random
 import pandas as pd
 import torch
