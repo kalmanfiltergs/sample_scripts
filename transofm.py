@@ -1,3 +1,69 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import pyarrow.parquet as pq
+
+class ParquetDataset(Dataset):
+    def __init__(self, parquet_files, columns=None):
+        """
+        Args:
+            parquet_files (list of str): List of paths to parquet files.
+            columns (list of str, optional): List of column names to load. If None, all columns are loaded.
+        """
+        self.parquet_files = parquet_files
+        self.columns = columns  # User-specified columns
+
+        # Read metadata to calculate total number of rows across all files
+        self.lengths = [pq.ParquetFile(f).metadata.num_rows for f in parquet_files]
+        self.cumulative_lengths = torch.cumsum(torch.tensor(self.lengths), dim=0)
+
+    def __len__(self):
+        return self.cumulative_lengths[-1].item()  # Total number of rows across all files
+
+    def __getitem__(self, idx):
+        # Determine which file the index belongs to
+        file_idx = (self.cumulative_lengths > idx).nonzero(as_tuple=False)[0].item()
+
+        if file_idx == 0:
+            row_idx = idx
+        else:
+            row_idx = idx - self.cumulative_lengths[file_idx - 1]
+
+        # Load the specific row from the corresponding file
+        df = pd.read_parquet(self.parquet_files[file_idx], columns=self.columns)
+
+        # Get the specific row
+        sample = df.iloc[row_idx]
+
+        # Convert the sample to a PyTorch tensor (can keep as a pandas row or return as is)
+        sample_tensor = torch.tensor(sample.values, dtype=torch.float32)
+
+        return sample_tensor
+
+# List of parquet files
+parquet_files = ['file1.parquet', 'file2.parquet']  # Example file list
+
+# Specify the columns you want to load from the parquet files
+columns_to_load = ['feature1', 'feature2', 'label']  # Example columns
+
+# Create the dataset with specified columns
+dataset = ParquetDataset(parquet_files, columns=columns_to_load)
+
+# Create DataLoader to load data in batches
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+# Example training loop
+for epoch in range(10):  # Training for 10 epochs
+    for batch_idx, data in enumerate(dataloader):
+        # Here, you can manually slice the data to get features and labels
+        # Example:
+        features = data[:, :-1]  # All except the last column are features
+        labels = data[:, -1]     # Last column is the label
+        
+        # Use features and labels in your model
+        print(f"Epoch {epoch}, Batch {batch_idx}, Features: {features.shape}, Labels: {labels.shape}")
+
+
 # Set model to evaluation mode
 model.eval()
 
