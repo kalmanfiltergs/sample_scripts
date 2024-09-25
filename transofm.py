@@ -1,105 +1,134 @@
-import os
-import pyarrow.parquet as pq
+import pyarrow.parquet as pq  # For reading Parquet files
 import torch
 from torch.utils.data import Dataset, DataLoader
 from multiprocessing import Pool, cpu_count
 import pandas as pd
 import bisect
-
+import random  # For sampling
 def get_num_rows(file_path):
+    """
+    Returns the number of rows in a Parquet file.
+    """
     try:
         parquet_file = pq.ParquetFile(file_path)
         return parquet_file.metadata.num_rows
-    except Exception as e:
-        print(f"Error reading {file_path}: {e}")
-        return 0
+    except:
+        return 0  # Return 0 if there's an error
 
 class ParquetDataset(Dataset):
-    def __init__(self, file_paths):
+    def __init__(self, file_paths, cache_size=1000):
         """
+        Initializes the dataset with a subset of Parquet files.
+        
         Args:
-            file_paths (list): List of paths to Parquet files.
+            file_paths (list): List of Parquet file paths for the current subset.
+            cache_size (int): Maximum number of files to cache in memory.
         """
         self.file_paths = file_paths
-        self.num_workers = min(100, cpu_count())  # Utilize up to 100 CPUs
-
-        # Parallelize the row counting
-        with Pool(self.num_workers) as pool:
+        self.cache_size = cache_size
+        self.cache = {}         # Cached DataFrames
+        self.cache_order = []   # Track cache order for LRU
+        
+        # Get row counts for all files in the subset
+        with Pool(min(100, cpu_count())) as pool:
             self.rows_per_file = pool.map(get_num_rows, self.file_paths)
-
-        # Create a cumulative sum for quick index mapping
+        
+        # Create cumulative row indices for quick access
         self.cumulative_rows = pd.Series(self.rows_per_file).cumsum().tolist()
         self.total_rows = self.cumulative_rows[-1] if self.cumulative_rows else 0
 
     def __len__(self):
         return self.total_rows
 
-    def __getitem__(self, idx):
-        # Binary search to find the file that contains the idx
-        file_idx = bisect.bisect_right(self.cumulative_rows, idx)
-        if file_idx == 0:
-            row_idx = idx
-        else:
-            row_idx = idx - self.cumulative_rows[file_idx - 1]
-
-        file_path = self.file_paths[file_idx]
-        
-        # Read only the required row
+    def _load_file(self, file_path):
+        """
+        Loads a Parquet file into a pandas DataFrame.
+        """
         try:
-            table = pq.read_table(
-                file_path,
-                columns=None,  # Specify columns if needed
-                use_threads=True,
-                skip_rows=row_idx,
-                num_rows=1
-            )
-            df = table.to_pandas()
-            data = df.iloc[0].to_dict()
-            
-            # Convert to tensors or desired format
-            # Example: Assuming all values are numerical and needed as float tensors
-            tensor = torch.tensor(list(data.values()), dtype=torch.float)
-            return tensor
-        except Exception as e:
-            print(f"Error reading row {row_idx} from {file_path}: {e}")
-            # Return a default tensor or handle the error as needed
-            return torch.zeros(1)  # Example default
+            table = pq.read_table(file_path)
+            return table.to_pandas()
+        except:
+            return pd.DataFrame()  # Return empty DataFrame on failure
 
+    def __getitem__(self, idx):
+        """
+        Retrieves a single data sample by global index.
+        """
+        # Determine which file the index belongs to
+        file_idx = bisect.bisect_right(self.cumulative_rows, idx)
+        row_idx = idx - self.cumulative_rows[file_idx - 1] if file_idx > 0 else idx
+        file_path = self.file_paths[file_idx]
+
+        # Check if the file is cached
+        if file_path in self.cache:
+            df = self.cache[file_path]
+            self.cache_order.remove(file_path)  # Update cache order
+        else:
+            df = self._load_file(file_path)      # Load file
+            self.cache[file_path] = df           # Add to cache
+            if len(self.cache_order) >= self.cache_size:
+                oldest = self.cache_order.pop(0)  # Evict oldest file
+                del self.cache[oldest]
+        
+        self.cache_order.append(file_path)  # Mark as recently used
+
+        # Retrieve the specific row and convert to tensor
+        try:
+            data = df.iloc[row_idx].to_dict()
+            return torch.tensor(list(data.values()), dtype=torch.float)
+        except:
+            return torch.zeros(1)  # Return default tensor on failure
 
 def create_dataloader(file_paths, batch_size=64, shuffle=True, num_workers=100):
+    """
+    Creates a PyTorch DataLoader for a subset of Parquet files.
+    
+    Args:
+        file_paths (list): List of Parquet file paths for the current subset.
+        batch_size (int): Number of samples per batch.
+        shuffle (bool): Whether to shuffle the data.
+        num_workers (int): Number of parallel data loading workers.
+    
+    Returns:
+        DataLoader: Configured PyTorch DataLoader.
+    """
     dataset = ParquetDataset(file_paths)
-    dataloader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=False,  # Disabled since no GPU is used
-        prefetch_factor=2,  # Adjust based on memory and performance
-        persistent_workers=True  # Keep workers alive between epochs for efficiency
+        pin_memory=False,            # Not needed for CPU-only
+        persistent_workers=True      # Keeps workers alive for efficiency
     )
-    return dataloader
 
+
+def stratified_sampling(file_list, n_samples=1000, n_repeats=10):
+    """
+    Generates stratified random subsets of files.
+    
+    Args:
+        file_list (list): Complete list of Parquet file paths.
+        n_samples (int): Number of files per subset.
+        n_repeats (int): Number of subsets to generate.
+    
+    Yields:
+        list: A subset of file paths.
+    """
+    for _ in range(n_repeats):
+        subset = random.sample(file_list, n_samples)
+        yield subset
 
 if __name__ == "__main__":
-    # Example list of Parquet files
-    file_list = [
-        '/path/to/data/file1.parquet',
-        '/path/to/data/file2.parquet',
-        # Add all your Parquet file paths here
-    ]
+    # Example list of all 100,000 Parquet files
+    file_list = ['/path/to/data/file1.parquet', '/path/to/data/file2.parquet', ...]  # Replace with actual paths
 
     # Parameters
     batch_size = 128
     num_epochs = 10
     learning_rate = 1e-3
-
-    # Create DataLoader
-    dataloader = create_dataloader(
-        file_paths=file_list,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=100  # Utilize all available CPUs
-    )
+    n_files = 1000    # Number of files per subset
+    n_repeats = 10    # Number of subsets to iterate through
 
     # Define your PyTorch model
     class YourPyTorchModel(torch.nn.Module):
@@ -123,28 +152,31 @@ if __name__ == "__main__":
 
     # Training Loop
     for epoch in range(num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        for batch_idx, batch in enumerate(dataloader):
-            batch = batch.to(device)
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        for subset_idx, subset_files in enumerate(stratified_sampling(file_list, n_files, n_repeats)):
+            dataloader = create_dataloader(
+                file_paths=subset_files,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=100
+            )
+            print(f"  Training on subset {subset_idx+1}/{n_repeats}")
+            steps = 0
+            for batch in dataloader:
+                inputs = batch[:, :-1].to(device)  # Adjust based on your data
+                targets = batch[:, -1].long().to(device)  # Adjust based on your data
+                
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                
+                steps += 1
+                if steps >= M:  # Define M (number of steps per subset)
+                    break
+        print(f"Epoch {epoch+1} completed.")
 
-            # Assume the last column is the target; adjust as needed
-            inputs = batch[:, :-1]
-            targets = batch[:, -1].long()
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-
-            if (batch_idx + 1) % 100 == 0:
-                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{batch_idx+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
-
-        avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{num_epochs}] completed. Average Loss: {avg_loss:.4f}")
 
 
 
