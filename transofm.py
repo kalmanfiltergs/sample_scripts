@@ -1,182 +1,124 @@
-import pyarrow.parquet as pq  # For reading Parquet files
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, DataLoader
-from multiprocessing import Pool, cpu_count
 import pandas as pd
-import bisect
-import random  # For sampling
-def get_num_rows(file_path):
-    """
-    Returns the number of rows in a Parquet file.
-    """
-    try:
-        parquet_file = pq.ParquetFile(file_path)
-        return parquet_file.metadata.num_rows
-    except:
-        return 0  # Return 0 if there's an error
+import os
 
 class ParquetDataset(Dataset):
-    def __init__(self, file_paths, cache_size=1000):
+    def __init__(self, file_paths, columns=None):
         """
-        Initializes the dataset with a subset of Parquet files.
-        
         Args:
-            file_paths (list): List of Parquet file paths for the current subset.
-            cache_size (int): Maximum number of files to cache in memory.
+            file_paths (list): List of paths to Parquet files.
+            columns (list, optional): Specific columns to load.
         """
-        self.file_paths = file_paths
-        self.cache_size = cache_size
-        self.cache = {}         # Cached DataFrames
-        self.cache_order = []   # Track cache order for LRU
+        self.data = []
+        for file in file_paths:
+            try:
+                # You can use either read_table or read_parquet
+                table = pq.read_table(file, columns=columns)  # Using read_table
+                # table = pq.read_parquet(file, columns=columns)  # Using read_parquet
+                df = table.to_pandas()
+                self.data.append(df)
+            except Exception as e:
+                print(f"Error loading {file}: {e}")
         
-        # Get row counts for all files in the subset
-        with Pool(min(100, cpu_count())) as pool:
-            self.rows_per_file = pool.map(get_num_rows, self.file_paths)
-        
-        # Create cumulative row indices for quick access
-        self.cumulative_rows = pd.Series(self.rows_per_file).cumsum().tolist()
-        self.total_rows = self.cumulative_rows[-1] if self.cumulative_rows else 0
-
-    def __len__(self):
-        return self.total_rows
-
-    def _load_file(self, file_path):
-        """
-        Loads a Parquet file into a pandas DataFrame.
-        """
-        try:
-            table = pq.read_table(file_path)
-            return table.to_pandas()
-        except:
-            return pd.DataFrame()  # Return empty DataFrame on failure
-
-    def __getitem__(self, idx):
-        """
-        Retrieves a single data sample by global index.
-        """
-        # Determine which file the index belongs to
-        file_idx = bisect.bisect_right(self.cumulative_rows, idx)
-        row_idx = idx - self.cumulative_rows[file_idx - 1] if file_idx > 0 else idx
-        file_path = self.file_paths[file_idx]
-
-        # Check if the file is cached
-        if file_path in self.cache:
-            df = self.cache[file_path]
-            self.cache_order.remove(file_path)  # Update cache order
+        if self.data:
+            self.data = pd.concat(self.data, ignore_index=True)
         else:
-            df = self._load_file(file_path)      # Load file
-            self.cache[file_path] = df           # Add to cache
-            if len(self.cache_order) >= self.cache_size:
-                oldest = self.cache_order.pop(0)  # Evict oldest file
-                del self.cache[oldest]
+            self.data = pd.DataFrame()
         
-        self.cache_order.append(file_path)  # Mark as recently used
-
-        # Retrieve the specific row and convert to tensor
-        try:
-            data = df.iloc[row_idx].to_dict()
-            return torch.tensor(list(data.values()), dtype=torch.float)
-        except:
-            return torch.zeros(1)  # Return default tensor on failure
-
-def create_dataloader(file_paths, batch_size=64, shuffle=True, num_workers=100):
-    """
-    Creates a PyTorch DataLoader for a subset of Parquet files.
+        numeric_cols = self.data.select_dtypes(include=['number']).columns
+        self.data = torch.tensor(self.data[numeric_cols].values, dtype=torch.float)
     
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+def create_dataloader(file_paths, columns=None, batch_size=64, shuffle=True, num_workers=4):
+    """
+    Creates a DataLoader for the given Parquet files with selected columns.
+
     Args:
-        file_paths (list): List of Parquet file paths for the current subset.
+        file_paths (list): List of Parquet file paths.
+        columns (list, optional): List of column names to load. Loads all if None.
         batch_size (int): Number of samples per batch.
-        shuffle (bool): Whether to shuffle the data.
-        num_workers (int): Number of parallel data loading workers.
-    
+        shuffle (bool): Whether to shuffle the data at every epoch.
+        num_workers (int): Number of subprocesses for data loading.
+
     Returns:
-        DataLoader: Configured PyTorch DataLoader.
+        DataLoader: Configured DataLoader object.
     """
-    dataset = ParquetDataset(file_paths)
-    return DataLoader(
+    dataset = ParquetDataset(file_paths, columns=columns)
+    dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=False,            # Not needed for CPU-only
-        persistent_workers=True      # Keeps workers alive for efficiency
+        pin_memory=False  # Set to True if using GPU
     )
+    return dataloader
 
-
-def stratified_sampling(file_list, n_samples=1000, n_repeats=10):
-    """
-    Generates stratified random subsets of files.
-    
-    Args:
-        file_list (list): Complete list of Parquet file paths.
-        n_samples (int): Number of files per subset.
-        n_repeats (int): Number of subsets to generate.
-    
-    Yields:
-        list: A subset of file paths.
-    """
-    for _ in range(n_repeats):
-        subset = random.sample(file_list, n_samples)
-        yield subset
 
 if __name__ == "__main__":
-    # Example list of all 100,000 Parquet files
-    file_list = ['/path/to/data/file1.parquet', '/path/to/data/file2.parquet', ...]  # Replace with actual paths
+    # Example directory containing 100 Parquet files
+    directory = '/path/to/parquet/files'  # Replace with your directory path
+    file_list = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith('.parquet')]
 
-    # Parameters
+    # Specify the columns you want to load
+    selected_columns = ['feature1', 'feature2', 'feature3', 'target']  # Replace with your column names
+
+    # Create DataLoader with desired parameters
     batch_size = 128
-    num_epochs = 10
-    learning_rate = 1e-3
-    n_files = 1000    # Number of files per subset
-    n_repeats = 10    # Number of subsets to iterate through
+    dataloader = create_dataloader(
+        file_paths=file_list,
+        columns=selected_columns,  # Pass the selected columns
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4  # Adjust based on your CPU cores
+    )
 
-    # Define your PyTorch model
-    class YourPyTorchModel(torch.nn.Module):
+    # Define a simple PyTorch model
+    class SimpleModel(torch.nn.Module):
         def __init__(self, input_size, num_classes):
-            super(YourPyTorchModel, self).__init__()
+            super(SimpleModel, self).__init__()
             self.fc = torch.nn.Linear(input_size, num_classes)
-        
+
         def forward(self, x):
             return self.fc(x)
 
-    # Initialize model, optimizer, and loss function
-    input_size = 100  # Replace with actual input size
-    num_classes = 10  # Replace with actual number of classes
-    model = YourPyTorchModel(input_size, num_classes)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # Initialize model, loss, and optimizer
+    input_size = len(selected_columns) - 1  # Assuming last column is the target
+    num_classes = 10  # Adjust based on your task
+    model = SimpleModel(input_size, num_classes)
     criterion = torch.nn.CrossEntropyLoss()
-
-    # Move model to CPU
-    device = torch.device('cpu')
-    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Training Loop
+    num_epochs = 5
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        for subset_idx, subset_files in enumerate(stratified_sampling(file_list, n_files, n_repeats)):
-            dataloader = create_dataloader(
-                file_paths=subset_files,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=100
-            )
-            print(f"  Training on subset {subset_idx+1}/{n_repeats}")
-            steps = 0
-            for batch in dataloader:
-                inputs = batch[:, :-1].to(device)  # Adjust based on your data
-                targets = batch[:, -1].long().to(device)  # Adjust based on your data
-                
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                
-                steps += 1
-                if steps >= M:  # Define M (number of steps per subset)
-                    break
-        print(f"Epoch {epoch+1} completed.")
+        model.train()
+        epoch_loss = 0.0
+        for batch in dataloader:
+            # Assume last column is the target
+            inputs = batch[:, :-1]
+            targets = batch[:, -1].long()
 
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}")
 
 
 
