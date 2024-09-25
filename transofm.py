@@ -1,3 +1,39 @@
+# Set model to evaluation mode
+model.eval()
+
+# Create DataLoader for inference data
+inference_dataloader = DataLoader(
+    dataset=ParquetDataset(file_list, columns=['col1', 'col2', 'col3', 'returns']),  # Add 'returns' column
+    batch_size=128,  # Adjust based on memory
+    shuffle=False,   # No need to shuffle for inference
+    num_workers=4
+)
+
+# Store predictions and actual returns for comparison
+all_predictions = []
+all_returns = []
+
+with torch.no_grad():  # Disable gradient calculation for inference
+    for batch in inference_dataloader:
+        inputs = batch[:, :-1].to(device)  # All columns except the last one (returns)
+        returns = batch[:, -1].to(device)  # The 'returns' column (last column)
+        
+        # Get model predictions
+        predictions = model(inputs)
+        
+        # Store predictions and returns for comparison
+        all_predictions.append(predictions.cpu())  # Move to CPU for comparison
+        all_returns.append(returns.cpu())          # Move to CPU for comparison
+
+# Concatenate all results from batches
+all_predictions = torch.cat(all_predictions, dim=0)
+all_returns = torch.cat(all_returns, dim=0)
+
+# Example: Compare predictions with returns
+comparison = torch.stack((all_predictions, all_returns), dim=1)  # Shape: [num_samples, 2]
+print(comparison[:10])  # Print the first 10 comparisons
+
+
 import os
 import pyarrow.parquet as pq  # For reading Parquet files
 import torch
