@@ -4,6 +4,67 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 class ParquetDataset(Dataset):
+    def __init__(self, parquet_files, columns=None, preload=False):
+        """
+        Args:
+            parquet_files (list of str): List of paths to parquet files.
+            columns (list of str, optional): List of column names to load. If None, all columns are loaded.
+            preload (bool): Whether to preload all data into memory.
+        """
+        self.parquet_files = parquet_files
+        self.columns = columns
+        self.preload = preload
+
+        if self.preload:
+            # Load all data into memory
+            self.data = pd.concat(
+                [pd.read_parquet(f, columns=self.columns) for f in self.parquet_files],
+                ignore_index=True
+            )
+        else:
+            # Read metadata to calculate total number of rows across all files
+            self.lengths = [pq.ParquetFile(f).metadata.num_rows for f in self.parquet_files]
+            self.cumulative_lengths = torch.cumsum(torch.tensor(self.lengths), dim=0)
+
+    def __len__(self):
+        if self.preload:
+            return len(self.data)
+        else:
+            return self.cumulative_lengths[-1].item()  # Total number of rows across all files
+
+    def __getitem__(self, idx):
+        if self.preload:
+            # Retrieve data from preloaded DataFrame
+            sample = self.data.iloc[idx]
+            sample_tensor = torch.tensor(sample.values, dtype=torch.float32)
+            return sample_tensor
+        else:
+            # Determine which file the index belongs to
+            file_idx = (self.cumulative_lengths > idx).nonzero(as_tuple=False)[0].item()
+
+            if file_idx == 0:
+                row_idx = idx
+            else:
+                row_idx = idx - self.cumulative_lengths[file_idx - 1]
+
+            # Load the specific row from the corresponding file
+            df = pd.read_parquet(self.parquet_files[file_idx], columns=self.columns)
+
+            # Get the specific row
+            sample = df.iloc[row_idx]
+
+            # Convert the sample to a PyTorch tensor (float32)
+            sample_tensor = torch.tensor(sample.values, dtype=torch.float32)
+
+            return sample_tensor
+
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import pyarrow.parquet as pq
+
+class ParquetDataset(Dataset):
     def __init__(self, parquet_files, columns=None):
         """
         Args:
