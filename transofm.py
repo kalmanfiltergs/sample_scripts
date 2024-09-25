@@ -1,57 +1,96 @@
-import pyarrow.parquet as pq
+import os
+import pyarrow.parquet as pq  # For reading Parquet files
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-import os
+import bisect
+from collections import OrderedDict  # For implementing LRU cache
 
 class ParquetDataset(Dataset):
-    def __init__(self, file_paths, columns=None):
+    def __init__(self, file_paths, columns=None, cache_size=10):
         """
         Args:
             file_paths (list): List of paths to Parquet files.
-            columns (list, optional): Specific columns to load.
+            columns (list, optional): List of column names to load. Loads all if None.
+            cache_size (int): Maximum number of files to cache in memory.
         """
-        self.data = []
-        for file in file_paths:
+        self.file_paths = file_paths
+        self.columns = columns
+        self.cache_size = cache_size
+        self.cache = OrderedDict()  # Initialize LRU cache
+        
+        # Calculate number of rows per file
+        self.rows_per_file = []
+        for file in self.file_paths:
             try:
-                # You can use either read_table or read_parquet
-                table = pq.read_table(file, columns=columns)  # Using read_table
-                # table = pq.read_parquet(file, columns=columns)  # Using read_parquet
-                df = table.to_pandas()
-                self.data.append(df)
+                parquet_file = pq.ParquetFile(file)
+                self.rows_per_file.append(parquet_file.metadata.num_rows)
             except Exception as e:
-                print(f"Error loading {file}: {e}")
+                print(f"Error reading {file}: {e}")
+                self.rows_per_file.append(0)
         
-        if self.data:
-            self.data = pd.concat(self.data, ignore_index=True)
-        else:
-            self.data = pd.DataFrame()
-        
-        numeric_cols = self.data.select_dtypes(include=['number']).columns
-        self.data = torch.tensor(self.data[numeric_cols].values, dtype=torch.float)
-    
+        # Create cumulative row indices for global indexing
+        self.cumulative_rows = pd.Series(self.rows_per_file).cumsum().tolist()
+        self.total_rows = self.cumulative_rows[-1] if self.cumulative_rows else 0
+
     def __len__(self):
-        return len(self.data)
-    
+        return self.total_rows
+
+    def _load_file(self, file_path):
+        """
+        Loads a Parquet file into a pandas DataFrame.
+        """
+        try:
+            table = pq.read_table(file_path, columns=self.columns)
+            df = table.to_pandas()
+            return df
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            return pd.DataFrame()
+
     def __getitem__(self, idx):
-        return self.data[idx]
+        # Determine which file the index belongs to
+        file_idx = bisect.bisect_right(self.cumulative_rows, idx)
+        row_idx = idx - self.cumulative_rows[file_idx - 1] if file_idx > 0 else idx
+        file_path = self.file_paths[file_idx]
+        
+        # Check if the file is in cache
+        if file_path in self.cache:
+            df = self.cache.pop(file_path)  # Remove to update order
+            self.cache[file_path] = df      # Re-insert as most recently used
+        else:
+            df = self._load_file(file_path)  # Load from disk
+            self.cache[file_path] = df       # Add to cache
+            if len(self.cache) > self.cache_size:
+                evicted_file, _ = self.cache.popitem(last=False)  # Evict LRU file
+                print(f"Evicted {evicted_file} from cache")
+        
+        # Retrieve the specific row
+        try:
+            data = df.iloc[row_idx].to_dict()
+            # Ensure all values are numeric; adjust if necessary
+            numeric_data = {k: v for k, v in data.items() if isinstance(v, (int, float))}
+            return torch.tensor(list(numeric_data.values()), dtype=torch.float)
+        except Exception as e:
+            print(f"Error accessing row {row_idx} from {file_path}: {e}")
+            return torch.zeros(1)  # Default tensor on failure
 
-
-def create_dataloader(file_paths, columns=None, batch_size=64, shuffle=True, num_workers=4):
+def create_dataloader(file_paths, columns=None, batch_size=64, shuffle=True, num_workers=4, cache_size=10):
     """
-    Creates a DataLoader for the given Parquet files with selected columns.
-
+    Creates a DataLoader for the given Parquet files with caching.
+    
     Args:
         file_paths (list): List of Parquet file paths.
-        columns (list, optional): List of column names to load. Loads all if None.
+        columns (list, optional): Specific columns to load. Loads all if None.
         batch_size (int): Number of samples per batch.
-        shuffle (bool): Whether to shuffle the data at every epoch.
-        num_workers (int): Number of subprocesses for data loading.
-
+        shuffle (bool): Whether to shuffle the data.
+        num_workers (int): Number of parallel data loading workers.
+        cache_size (int): Number of files to cache in memory.
+    
     Returns:
         DataLoader: Configured DataLoader object.
     """
-    dataset = ParquetDataset(file_paths, columns=columns)
+    dataset = ParquetDataset(file_paths, columns=columns, cache_size=cache_size)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -61,41 +100,42 @@ def create_dataloader(file_paths, columns=None, batch_size=64, shuffle=True, num
     )
     return dataloader
 
-
+# Example Usage
 if __name__ == "__main__":
-    # Example directory containing 100 Parquet files
+    # Directory containing 100 Parquet files
     directory = '/path/to/parquet/files'  # Replace with your directory path
     file_list = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith('.parquet')]
-
+    
     # Specify the columns you want to load
-    selected_columns = ['feature1', 'feature2', 'feature3', 'target']  # Replace with your column names
-
-    # Create DataLoader with desired parameters
+    selected_columns = ['col1', 'col2', 'col3', 'target']  # Replace with your column names
+    
+    # Create DataLoader with caching
     batch_size = 128
     dataloader = create_dataloader(
         file_paths=file_list,
-        columns=selected_columns,  # Pass the selected columns
+        columns=selected_columns,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4  # Adjust based on your CPU cores
+        num_workers=4,      # Adjust based on your CPU cores
+        cache_size=20        # Number of files to cache; adjust as needed
     )
-
+    
     # Define a simple PyTorch model
     class SimpleModel(torch.nn.Module):
         def __init__(self, input_size, num_classes):
             super(SimpleModel, self).__init__()
             self.fc = torch.nn.Linear(input_size, num_classes)
-
+    
         def forward(self, x):
             return self.fc(x)
-
+    
     # Initialize model, loss, and optimizer
     input_size = len(selected_columns) - 1  # Assuming last column is the target
     num_classes = 10  # Adjust based on your task
-    model = SimpleModel(input_size, num_classes)
+    model = SimpleModel(input_size + 1, num_classes)  # +1 if you add new features
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
+    
     # Training Loop
     num_epochs = 5
     for epoch in range(num_epochs):
@@ -105,18 +145,23 @@ if __name__ == "__main__":
             # Assume last column is the target
             inputs = batch[:, :-1]
             targets = batch[:, -1].long()
-
+    
+            # Example: Generate a new feature (col1 + col2)
+            new_feature = inputs[:, 0] + inputs[:, 1]
+            new_feature = new_feature.unsqueeze(1)  # Make it a column
+            inputs = torch.cat((inputs, new_feature), dim=1)  # Append new feature
+    
             # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-
+    
             # Backward pass and optimization
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
+    
             epoch_loss += loss.item()
-
+    
         avg_loss = epoch_loss / len(dataloader)
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}")
 
