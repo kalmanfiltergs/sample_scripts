@@ -1,14 +1,64 @@
-find /path/to/folder1 -type f | while read -r filepath; do
-    # Compute the relative path from folder1
-    rel_path="${filepath#/path/to/folder1/}"
-    # Determine the destination path
-    dest_path="/path/to/folder2/$rel_path"
-    # Create the destination directory if it doesn't exist
-    dest_dir=$(dirname "$dest_path")
-    mkdir -p "$dest_dir"
-    # Move the file without overwriting
-    mv -n "$filepath" "$dest_path"
+#!/bin/bash
+
+# Define source and destination directories
+SOURCE_DIR="/path/to/folder1"
+DEST_DIR="/path/to/folder2"
+
+# Ensure both source and destination directories exist
+if [[ ! -d "$SOURCE_DIR" ]]; then
+    echo "Source directory '$SOURCE_DIR' does not exist."
+    exit 1
+fi
+
+if [[ ! -d "$DEST_DIR" ]]; then
+    echo "Destination directory '$DEST_DIR' does not exist. Creating it."
+    mkdir -p "$DEST_DIR"
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to create destination directory '$DEST_DIR'."
+        exit 1
+    fi
+fi
+
+# Loop through each date directory in the source directory
+for date_dir in "$SOURCE_DIR"/*/; do
+    # Check if it's a directory
+    if [[ -d "$date_dir" ]]; then
+        # Extract the basename (e.g., 20220101)
+        date=$(basename "$date_dir")
+        
+        # Define corresponding destination directory
+        dest_date_dir="$DEST_DIR/$date"
+        
+        # Create the destination date directory if it doesn't exist
+        if [[ ! -d "$dest_date_dir" ]]; then
+            echo "Creating destination directory: $dest_date_dir"
+            mkdir -p "$dest_date_dir"
+            if [[ $? -ne 0 ]]; then
+                echo "Failed to create directory '$dest_date_dir'. Skipping."
+                continue
+            fi
+        fi
+        
+        # Move files from source date directory to destination date directory without overwriting
+        echo "Moving files from '$date_dir' to '$dest_date_dir/' without overwriting..."
+        
+        # Use mv with -n to avoid overwriting existing files
+        # The double quotes handle filenames with spaces
+        # Using shopt to include hidden files if necessary
+        shopt -s dotglob  # Include hidden files
+        mv -n "$date_dir"* "$dest_date_dir"/
+        shopt -u dotglob  # Disable dotglob
+        
+        # Optional: Remove the source date directory if it's empty
+        if [[ -z "$(ls -A "$date_dir")" ]]; then
+            echo "Removing empty source directory: $date_dir"
+            rmdir "$date_dir"
+        fi
+    fi
 done
+
+echo "File moving process completed."
+
 
 import torch
 from torch.utils.data import Dataset, DataLoader
