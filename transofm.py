@@ -1,3 +1,15 @@
+find /path/to/folder1 -type f | while read -r filepath; do
+    # Compute the relative path from folder1
+    rel_path="${filepath#/path/to/folder1/}"
+    # Determine the destination path
+    dest_path="/path/to/folder2/$rel_path"
+    # Create the destination directory if it doesn't exist
+    dest_dir=$(dirname "$dest_path")
+    mkdir -p "$dest_dir"
+    # Move the file without overwriting
+    mv -n "$filepath" "$dest_path"
+done
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
