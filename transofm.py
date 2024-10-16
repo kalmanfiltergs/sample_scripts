@@ -1,123 +1,66 @@
 import numpy as np
-import pandas as pd
 
-def rolling_metric(
-    df, 
-    y_col,       # type: str
-    x_col,       # type: str
-    window,      # type: int
-    metric_func, # type: callable
-    min_window,  # type: int
-    **kwargs
-):
+def simulate_trades_numpy(time_series, bid, ask, req_edge, NAV1, NAV2):
     """
-    Compute a rolling metric over the DataFrame using a specified metric function.
-
+    Simulate trades based on the provided time series data and conditions, using numpy arrays.
+    
     Parameters:
-    - df (pd.DataFrame): DataFrame containing the data.
-    - y_col (str): Name of the dependent variable column.
-    - x_col (str): Name of the independent variable column.
-    - window (int): Size of the rolling window.
-    - metric_func (callable): Function to compute the metric over each window.
-    - min_window (int): Minimum number of observations required to compute the metric.
-    - **kwargs: Additional keyword arguments to pass to the metric function.
-
+    - time_series (np.ndarray): Timestamps for each data point in the day.
+    - bid (np.ndarray): Bid prices for the symbol.
+    - ask (np.ndarray): Ask prices for the symbol.
+    - req_edge (float): Required edge to consider a trade.
+    - NAV1 (np.ndarray): NAV1 values over time.
+    - NAV2 (np.ndarray): NAV2 values over time.
+    
     Returns:
-    - pd.Series: Rolling metric values aligned with the original DataFrame index.
+    - trades (list of dicts): List of trading opportunities with relevant information.
     """
-    y = df[y_col].values
-    x = df[x_col].values
-    n = len(y)
+    trades = []  # List to store trade information
 
-    if window < min_window:
-        raise ValueError("Window size must be at least as large as min_window.")
+    # Iterate over the time series to check for trading opportunities
+    for i in range(len(time_series)):
+        p_sell = NAV1[i] + req_edge  # Sell price threshold
+        p_buy = NAV2[i] - req_edge   # Buy price threshold
 
-    # Create rolling windows using stride tricks
-    shape = (n - window + 1, window)
-    strides = (y.strides[0], y.strides[0])
+        # Check if there's a selling opportunity (p_sell <= ask - 0.01)
+        if p_sell <= ask[i] - 0.01:
+            trades.append({
+                'time': time_series[i],
+                'direction': -1,  # Sell
+                'bid': bid[i],
+                'ask': ask[i],
+                'p_sell': p_sell,
+                'p_buy': p_buy,
+                'NAV1': NAV1[i],
+                'NAV2': NAV2[i]
+            })
 
-    y_roll = np.lib.stride_tricks.as_strided(y, shape=shape, strides=strides)
-    x_roll = np.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+        # Check if there's a buying opportunity (p_buy >= bid + 0.01)
+        if p_buy >= bid[i] + 0.01:
+            trades.append({
+                'time': time_series[i],
+                'direction': 1,  # Buy
+                'bid': bid[i],
+                'ask': ask[i],
+                'p_sell': p_sell,
+                'p_buy': p_buy,
+                'NAV1': NAV1[i],
+                'NAV2': NAV2[i]
+            })
 
-    # Compute the metric over each window
-    metric_values = metric_func(y_roll, x_roll, **kwargs)
+    return trades
 
-    # Initialize the result with NaNs
-    metric_series = pd.Series(data=np.nan, index=df.index)
+# Example data (numpy arrays)
+time_series = np.array(['09:30', '09:31', '09:32'])
+bid = np.array([100.5, 100.6, 100.7])
+ask = np.array([101.0, 101.1, 101.2])
+NAV1 = np.array([100.8, 100.9, 101.0])
+NAV2 = np.array([100.2, 100.3, 100.4])
+req_edge = 0.02
 
-    # Assign computed metric values where the window condition is met
-    metric_series.iloc[window - 1:] = metric_values
+# Call the function with numpy arrays
+trades = simulate_trades_numpy(time_series, bid, ask, req_edge, NAV1, NAV2)
 
-    return metric_series
-
-def wls_slope_no_intercept(
-    y_roll,   # type: np.ndarray
-    x_roll,   # type: np.ndarray
-    weights    # type: np.ndarray
-):
-    """
-    Compute the WLS slope without intercept over rolling windows.
-
-    Parameters:
-    - y_roll (np.ndarray): 2D array of rolling windows for y.
-    - x_roll (np.ndarray): 2D array of rolling windows for x.
-    - weights (np.ndarray): 1D array of weights.
-
-    Returns:
-    - np.ndarray: Array of WLS slope values.
-    """
-    # Normalize weights to sum to 1
-    weights = weights / weights.sum()
-
-    # Reshape weights for broadcasting
-    w = weights.reshape(1, -1)
-
-    # Calculate weighted sums
-    weighted_xy = w * x_roll * y_roll
-    weighted_xx = w * x_roll ** 2
-
-    # Sum over the window
-    numerator = weighted_xy.sum(axis=1)
-    denominator = weighted_xx.sum(axis=1)
-
-    # Calculate slope; handle division by zero
-    slope = np.divide(numerator, denominator, 
-                      out=np.full_like(numerator, np.nan), 
-                      where=denominator != 0)
-
-    return slope
-
-def rolling_corr(
-    y_roll, # type: np.ndarray
-    x_roll  # type: np.ndarray
-):
-    """
-    Compute the rolling correlation between y and x.
-
-    Parameters:
-    - y_roll (np.ndarray): 2D array of rolling windows for y.
-    - x_roll (np.ndarray): 2D array of rolling windows for x.
-
-    Returns:
-    - np.ndarray: Array of correlation coefficients.
-    """
-    # Compute means
-    y_mean = y_roll.mean(axis=1, keepdims=True)
-    x_mean = x_roll.mean(axis=1, keepdims=True)
-
-    # Demean the data
-    y_demean = y_roll - y_mean
-    x_demean = x_roll - x_mean
-
-    # Compute numerator and denominator for correlation
-    numerator = (y_demean * x_demean).sum(axis=1)
-    denominator = np.sqrt((y_demean ** 2).sum(axis=1) * (x_demean ** 2).sum(axis=1))
-
-    # Calculate correlation; handle division by zero
-    corr = np.divide(numerator, denominator, 
-                     out=np.full_like(numerator, np.nan), 
-                     where=denominator != 0)
-
-    return corr
-
-
+# Example output
+for trade in trades:
+    print(trade)
